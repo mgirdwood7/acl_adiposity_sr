@@ -1,0 +1,359 @@
+---
+title: "ACL Adiposity SR Sensitivity Analyses"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-location: left
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, error = FALSE)
+
+library(tidyverse)
+library(metafor)
+library(kableExtra)
+library(mgfunctions)
+library(ggdist)
+
+outcome <- read_csv("data/processed/data_clean_20251022.csv")
+
+
+bmdata <- outcome %>%
+  filter(variable %in% c("BMI", "Body mass (kg)"),
+         !is.na(yi)) %>%
+  mutate(var_no = case_when(
+    variable == "BMI" ~ 1, # use for filtering later, to prefer BMI measure if available
+    variable == "Body mass (kg)" ~ 2
+  )) %>%
+  group_by(cohort) %>%
+  filter(var_no == min(var_no)) %>% # filter BMI if available, otherwise use bodymass
+  ungroup()
+
+baselinebm <- bmdata %>%
+  group_by(cohort) %>%
+  filter(any(timepoint_min < 3.1),
+         timepoint != min(timepoint)) %>%
+  filter(!cohort %in% c("Moksnes_2013", "Macalpine_2019", "Garcia_2020", "Hanstein_2019",
+                       "Rodriguez_2022", "Whittaker_2025"),
+         !(cohort == "Triplett_2022" & group == "Adolescent")) %>% # studies with mean age <18
+  ungroup()
+
+
+# Functiont to combine intercept and timepoint estimate (accounting for variance)
+linearcombination <- function(model, timepoint){
+  model <- robust(model, cluster = cohort, clubSandwich = TRUE)
+b <- coef(model)
+V <- vcov(model)
+
+# Predicted value at 10 years
+est_10 <- b["intrcpt"] + timepoint * b["timepoint"]
+
+# Variance and SE
+var_10 <- V["intrcpt", "intrcpt"] +
+  timepoint^2 * V["timepoint", "timepoint"] +
+  2 * timepoint * V["intrcpt", "timepoint"]
+
+se_10 <- sqrt(var_10)
+
+# 95% CI
+ci_10 <- est_10 + c(-1.96, 1.96) * se_10
+
+return(list(est_10, ci_10))
+
+}
+
+```
+
+## Leave one out analysis
+
+Refit model dropping one study at a time. Compare visual fit for now.
+
+- Black = original fit
+- Red = with study dropped
+
+```{r}
+#| fig-height: 15
+# Create list of datasets dropping 1 cohort at a time
+
+
+
+baselinebm <- baselinebm %>%
+  mutate(cohort = case_match(cohort,
+                             "MOON" ~ "Spindler_2018",
+                             "Delaware-oslo" ~ "Pederson_2021",
+                             .default = cohort))
+
+# Original models from primary analysis
+# Construct covariance matrix
+baselineV <- vcalc(vi, 
+               cluster=cohort, 
+               time1=timepoint,
+               phi=0.95, 
+               data=baselinebm)
+
+# Fit model
+linearbm <- rma.mv(yi, baselineV, 
+                  mods = ~ timepoint, 
+                  data = baselinebm, 
+                  random = list(~ timepoint|cohort),
+                  struct = c("CAR"))
+
+dropped_datasets <- lapply(unique(baselinebm[["cohort"]]), function(cohort) {
+  baselinebm[ baselinebm[["cohort"]] != cohort, ]
+})
+
+names(dropped_datasets) <- str_replace(paste0("drop ", unique(baselinebm$cohort)), "_", " ") # name each list element by cohort dropped
+
+
+# Get original predicted model estimates
+points_orig <- data.frame(predict(robust(linearbm, cluster = cohort, clubSandwich = TRUE),
+                                  newmods = seq(1,240, length = 240), transf = exp)) %>% 
+  mutate(x = row_number()) %>%
+  rename_with(.cols = pred:pi.ub, .fn = ~paste("orig", .x, sep = "_"))
+
+# function to iterate through each dropped dataset
+run_metaformodel <- function(data){
+  
+  # generate V
+  looV <- vcalc(vi, 
+             cluster=cohort, 
+             time1=timepoint,
+             phi=0.95, 
+             data=data)
+  
+  # run model
+  model <- rma.mv(yi, looV, 
+                 mods = ~ timepoint, 
+                 data = data, 
+                 random = list(~ timepoint|cohort),
+                 struct = c("CAR"))
+  
+  # get predicted fit
+  points <- data.frame(predict(robust(model, cluster = cohort, clubSandwich = TRUE), newmods = seq(1,240, length = 240), transf = exp)) %>% 
+    mutate(x = row_number()) %>% left_join(points_orig, by = "x")
+  
+  return(points)
+}
+
+loo_analysis <- dropped_datasets %>% 
+  map(run_metaformodel) %>%
+  bind_rows(.id = "cohort_dropped")
+
+# plot each with red line as new, black line as original
+ggplot(loo_analysis, aes(x = x)) +
+  geom_line(aes(y = pred), colour = "red", alpha = 0.7) +
+  geom_ribbon(aes(ymin = ci.lb, ymax = ci.ub), fill = "red", alpha = 0.3) +
+  geom_line(aes(y = orig_pred), alpha = 0.7) +
+  geom_ribbon(aes(ymin = orig_ci.lb, ymax = orig_ci.ub), alpha = 0.3) +
+  facet_wrap(~cohort_dropped, ncol = 3) +
+  scale_y_continuous(breaks = c(0.95, 1.0, 1.05, 1.1, 1.2), labels = c("-5%", "0%", "+5%", "+10%", "+20%")) +
+  scale_x_continuous(breaks = c(0, 24, 60, 120, 240), labels = c(0, 2, 5, 10, 20)) +
+  labs(x = "Time (years)", y = "Change in BMI/bodymass") +
+  theme_mgpub() +
+  theme(panel.grid.major.x = element_line(linewidth = rel(0.5), linetype = 2))
+
+```
+
+## Continuous Time - phi sensitivity
+
+```{r, echo = TRUE}
+#| fig-height: 10
+# Construct covariance matrix
+baselineV95 <- vcalc(vi, 
+               cluster=cohort, 
+               time1=timepoint,
+               phi=0.95, 
+               data=baselinebm)
+
+# Construct covariance matrix
+baselineV90 <- vcalc(vi, 
+               cluster=cohort, 
+               time1=timepoint,
+               phi=0.90, 
+               data=baselinebm)
+
+# Construct covariance matrix
+baselineV85 <- vcalc(vi, 
+               cluster=cohort, 
+               time1=timepoint,
+               phi=0.85, 
+               data=baselinebm)
+
+# Fit model
+linearbm95 <- rma.mv(yi, baselineV95, 
+                  mods = ~ timepoint, 
+                  data = baselinebm, 
+                  random = list(~ timepoint|cohort),
+                  struct = c("CAR"))
+
+# Fit model
+linearbm90 <- rma.mv(yi, baselineV90, 
+                  mods = ~ timepoint, 
+                  data = baselinebm, 
+                  random = list(~ timepoint|cohort),
+                  struct = c("CAR"))
+
+# Fit model
+linearbm85 <- rma.mv(yi, baselineV85, 
+                  mods = ~ timepoint, 
+                  data = baselinebm, 
+                  random = list(~ timepoint|cohort),
+                  struct = c("CAR"))
+
+points95 <- data.frame(predict(robust(linearbm95, cluster = cohort, clubSandwich = TRUE),
+                             newmods = seq(1,240, length = 240), transf = exp)) %>% 
+  mutate(x = row_number())
+
+points90 <- data.frame(predict(robust(linearbm90, cluster = cohort, clubSandwich = TRUE),
+                             newmods = seq(1,240, length = 240), transf = exp)) %>% 
+  mutate(x = row_number())
+
+points85 <- data.frame(predict(robust(linearbm85, cluster = cohort, clubSandwich = TRUE),
+                             newmods = seq(1,240, length = 240), transf = exp)) %>% 
+  mutate(x = row_number())
+
+
+ggplot() +
+  geom_lineribbon(data = points95, aes(x = x, y = pred, ymin = ci.lb, ymax = ci.ub, colour = "Original (95)"), alpha = 0.6) +
+  geom_lineribbon(data = points90, aes(x = x, y = pred, ymin = ci.lb, ymax = ci.ub, colour = "90"), alpha = 0.6) +
+  geom_lineribbon(data = points85, aes(x = x, y = pred, ymin = ci.lb, ymax = ci.ub, colour = "85"), alpha = 0.6) +
+  scale_y_continuous(breaks = c(0.95, 1.0, 1.05, 1.1, 1.2), labels = c("-5%", "0%", "+5%", "+10%", "+20%")) +
+  scale_x_continuous(breaks = c(0, 24, 60, 120, 240), labels = c(0, 2, 5, 10, 20)) +
+  labs(x = "Time (years)", y = "Change in BMI/bodymass") +
+  theme_mgpub() +
+  theme(panel.grid.major.x = element_line(linewidth = rel(0.5), linetype = 2))
+
+```
+
+
+## Time waves - phi sensitivity
+
+
+```{r, echo = TRUE}
+wave <- read_csv("data/processed/data_clean_wave_20251022.csv")
+
+
+waves <- tibble::tibble(
+  wave_label = factor(c("0–6", "6–12", "12–24", "24–72", "72-240"), levels = c("0–6", "6–12", "12–24", "24–72", "72-240")),
+  wave_start = c(0, 6, 12, 24, 72),
+  wave_end   = c(6, 12, 24, 72, 240)
+)
+
+# fit data to each wave 
+expanded <- wave %>%
+  filter(!is.na(vi)) %>%
+  crossing(waves) %>%
+  filter(timepoint_pre <= wave_start + 3,
+         timepoint > wave_start,
+         timepoint > wave_start + ((wave_end - wave_start)/2)) # make sure data covers at least half the wave
+
+
+bm_wave <- expanded %>%
+  filter(variable %in% c("BMI", "Body mass (kg)"),
+         !is.na(yi)) %>%
+  mutate(var_no = case_when(
+    variable == "BMI" ~ 1, # use for filtering later, to prefer BMI measure if available
+    variable == "Body mass (kg)" ~ 2
+  )) %>%
+  group_by(cohort) %>%
+  filter(var_no == min(var_no)) %>% # filter BMI if available, otherwise use bodymass
+  ungroup() %>%
+  group_by(cohort) %>%
+  filter(!cohort %in% c("Moksnes_2013", "Macalpine_2019", "Garcia_2020", "Hanstein_2019",
+                        "Rodriguez_2022", "Whittaker_2025"),
+           !(cohort == "Triplett_2022" & group == "Adolescent")) %>% # studies with mean age <18
+  ungroup()
+
+```
+
+```{r, echo = TRUE}
+
+# Fit covariance matrix again
+waveV95 <- vcalc(vi_d, 
+               cluster=cohort, 
+               time1 = wave_start,
+               phi=0.95, 
+               data=bm_wave)
+
+waveV90 <- vcalc(vi_d, 
+               cluster=cohort, 
+               time1 = wave_start,
+               phi=0.9, 
+               data=bm_wave)
+
+waveV85 <- vcalc(vi_d, 
+               cluster=cohort, 
+               time1 = wave_start,
+               phi=0.85, 
+               data=bm_wave)
+
+
+# Fit model
+wave95 <- rma.mv(yi_d, waveV95, 
+               mods = ~ wave_label - 1, 
+               data = bm_wave, 
+               random = list(~ wave_label|cohort),
+               struct = c("HAR"))
+
+wave90 <- rma.mv(yi_d, waveV90, 
+               mods = ~ wave_label - 1, 
+               data = bm_wave, 
+               random = list(~ wave_label|cohort),
+               struct = c("HAR"))
+
+wave85 <- rma.mv(yi_d, waveV85, 
+               mods = ~ wave_label - 1, 
+               data = bm_wave, 
+               random = list(~ wave_label|cohort),
+               struct = c("HAR"))
+
+
+wave_estimates <- function(model){
+res <- model
+est <- coef(res)
+V <- vcov(res)
+
+lengths <- c(6, 6, 12, 48, 168)   # months
+D <- diag(lengths)
+
+L <- rbind(
+  c(1, 0, 0, 0, 0),
+  c(1, 1, 0, 0, 0),
+  c(1, 1, 1, 0, 0),
+  c(1, 1, 1, 1, 0),
+  c(1, 1, 1, 1, 1)
+)
+
+cum_est <- as.numeric(L %*% (D %*% est))
+cum_se  <- sqrt(diag(L %*% (D %*% V %*% D) %*% t(L)))
+
+cum_lwr <- cum_est - 1.96 * cum_se
+cum_upr <- cum_est + 1.96 * cum_se
+
+result <- data.frame(
+  time = c(6, 12, 24, 72, 240),
+  cum_est, cum_lwr, cum_upr
+) %>%
+  bind_rows(., data.frame(time = 0, cum_est = 0, cum_lwr = 0, cum_upr = 0)) %>%
+  mutate(across(c(cum_est, cum_lwr, cum_upr), ~exp(.x))) %>%
+  arrange(time)
+
+return(result)
+}
+
+result95 <- wave_estimates(wave95)
+result90 <- wave_estimates(wave90)
+result85 <- wave_estimates(wave85)
+
+ggplot() +
+    geom_lineribbon(data = result95, aes(x = time, y = cum_est, ymin = cum_lwr, ymax = cum_upr, colour = "wave95"),
+                     alpha = 0.6, inherit.aes = F) +
+  geom_lineribbon(data = result90, aes(x = time, y = cum_est, ymin = cum_lwr, ymax = cum_upr, colour = "wave90"),
+                     alpha = 0.6, inherit.aes = F) +
+  geom_lineribbon(data = result85, aes(x = time, y = cum_est, ymin = cum_lwr, ymax = cum_upr, colour = "wave85"),
+                     alpha = 0.6, inherit.aes = F)
+
+```
+
+

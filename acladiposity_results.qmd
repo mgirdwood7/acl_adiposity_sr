@@ -1,0 +1,404 @@
+---
+title: "ACL Adiposity SR Results"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-location: left
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, error = FALSE)
+
+library(tidyverse)
+library(metafor)
+library(kableExtra)
+library(mgfunctions)
+library(ggdist)
+
+outcome <- read_csv("data/processed/data_clean_20251022.csv")
+
+
+bmdata <- outcome %>%
+  filter(variable %in% c("BMI", "Body mass (kg)"),
+         !is.na(yi)) %>%
+  mutate(var_no = case_when(
+    variable == "BMI" ~ 1, # use for filtering later, to prefer BMI measure if available
+    variable == "Body mass (kg)" ~ 2
+  )) %>%
+  group_by(cohort) %>%
+  filter(var_no == min(var_no)) %>% # filter BMI if available, otherwise use bodymass
+  ungroup()
+
+baselinebm <- bmdata %>%
+  group_by(cohort) %>%
+  filter(any(timepoint_min < 3.1),
+         timepoint != min(timepoint)) %>%
+  filter(!cohort %in% c("Moksnes_2013", "Macalpine_2019", "Garcia_2020", "Hanstein_2019",
+                       "Rodriguez_2022", "Whittaker_2025"),
+         !(cohort == "Triplett_2022" & group == "Adolescent")) %>% # studies with mean age <18
+  ungroup()
+
+
+# Functiont to combine intercept and timepoint estimate (accounting for variance)
+linearcombination <- function(model, timepoint){
+  model <- robust(model, cluster = cohort, clubSandwich = TRUE)
+b <- coef(model)
+V <- vcov(model)
+
+# Predicted value at 10 years
+est_10 <- b["intrcpt"] + timepoint * b["timepoint"]
+
+# Variance and SE
+var_10 <- V["intrcpt", "intrcpt"] +
+  timepoint^2 * V["timepoint", "timepoint"] +
+  2 * timepoint * V["intrcpt", "timepoint"]
+
+se_10 <- sqrt(var_10)
+
+# 95% CI
+ci_10 <- est_10 + c(-1.96, 1.96) * se_10
+
+return(list(est_10, ci_10))
+
+}
+
+```
+
+## Continuous Time
+
+```{r, echo = TRUE}
+#| fig-height: 10
+# Construct covariance matrix
+baselineV <- vcalc(vi, 
+               cluster=cohort, 
+               time1=timepoint,
+               phi=0.95, 
+               data=baselinebm)
+
+# Fit model
+linearbm <- rma.mv(yi, baselineV, 
+                  mods = ~ timepoint, 
+                  data = baselinebm, 
+                  random = list(~ timepoint|cohort),
+                  struct = c("CAR"))
+
+# check model fits
+profile(linearbm)
+
+summary(linearbm)
+
+broom::tidy(linearbm, exponentiate = TRUE) %>% kbl(digits = 3)
+
+## 10 year change estimate:
+#broom::tidy(linearbm, conf.int = TRUE) %>% select(term, estimate, conf.low, conf.high) %>% #filter(term == "timepoint") %>% mutate(across(where(is.numeric), ~exp(.x*120))) %>% kbl(digits = 3)
+
+data.frame(predict(robust(linearbm, cluster = cohort, clubSandwich = TRUE),
+                   newmods = 120, transf = exp)) %>% kbl(digits = 3)
+
+```
+
+```{r}
+points <- data.frame(predict(robust(linearbm, cluster = cohort, clubSandwich = TRUE),
+                             newmods = seq(1,240, length = 240), transf = exp)) %>% 
+  mutate(x = row_number())
+
+
+poly <- points %>% 
+  select(ci.ub, x) %>% 
+  bind_rows(., points %>% 
+              select(ci.lb, x) %>% 
+              rename(ci.ub = ci.lb) %>% 
+              arrange(desc(x))) # reverse them so the path isnt crossed
+
+pred <- points %>% 
+  select(pi.ub, x) %>% 
+  bind_rows(., points %>% 
+              select(pi.lb, x) %>% 
+              rename(pi.ub = pi.lb) %>% 
+              arrange(desc(x))) # reverse them so the path isnt crossed
+
+
+baselinebm %>%
+  bind_rows(., baselinebm %>% distinct(cohort, .keep_all = TRUE) %>%
+              mutate(timepoint = 0,
+                     yi = 0)) %>%
+  ggplot(aes(x = timepoint, y = exp(yi), group = cohort)) +
+  geom_hline(yintercept = 1, colour = "dark grey") +
+  geom_line(alpha = 0.8, colour = "grey") + 
+  geom_point(aes(size = actual_n), alpha = 0.3) + 
+  scale_y_continuous(breaks = c(0.95, 1.0, 1.05, 1.1, 1.2), labels = c("-5%", "0%", "+5%", "+10%", "+20%")) +
+  #scale_y_continuous(labels = scales::percent, limits = c(-0.75, 0.25)) +
+  #scale_x_continuous(trans = 'log10', limits = c(3,150)) +
+  scale_x_continuous(breaks = c(0, 24, 60, 120, 240), labels = c(0, 2, 5, 10, 20)) +
+  geom_line(data = points, aes(x = x, y = pred), colour = "red", linewidth = 1.3, inherit.aes = FALSE) +
+  geom_polygon(data = poly, aes(x = x, y = ci.ub), fill = "red",  alpha = 0.2, inherit.aes = FALSE) +
+  labs(x = "Time (years)", y = "Change in BMI/bodymass") +
+  theme_mgpub() +
+  theme(panel.grid.major.x = element_line(linewidth = rel(0.5), linetype = 2))
+
+baselinebm %>%
+  bind_rows(., baselinebm %>% distinct(cohort, .keep_all = TRUE) %>%
+              mutate(timepoint = 0.1,
+                     yi = 0)) %>%
+  ggplot(aes(x = timepoint, y = exp(yi), group = cohort)) +
+  geom_hline(yintercept = 1, colour = "dark grey") +
+  geom_line(alpha = 0.8, colour = "grey") + 
+  geom_point(aes(size = actual_n), alpha = 0.3) + 
+  scale_y_continuous(limits = c(0.95, 1.2), breaks = c(0.95, 1.0, 1.05, 1.1, 1.2), labels = c("-5%", "0%", "+5%", "+10%", "+20%")) +
+  scale_x_continuous(breaks = c(6, 24, 60, 120, 240), labels = c(0.5,2,5,10,20)) +
+  coord_trans(x = "log10", xlim = c(2, 250)) +
+  #scale_y_continuous(labels = scales::percent, limits = c(-0.75, 0.25)) +
+  #scale_x_continuous(trans = 'log10', limits = c(3,250), breaks = c(6, 24, 60, 120, 240), labels = c(0.5,2,5,10,20)) +
+  #scale_x_continuous(breaks = c(0, 24, 60, 120, 240), labels = c(0, 2, 5, 10, 20)) +
+  geom_line(data = points , aes(x = x, y = pred), colour = "red", linewidth = 1.3, inherit.aes = FALSE) +
+  ggdist::geom_lineribbon(points, mapping = aes(x = x, ymin = ci.lb, ymax = ci.ub), fill = "red", alpha = 0.2, inherit.aes = FALSE) +
+  #geom_polygon(data = poly %>% filter(x > 3), aes(x = x, y = ci.ub), fill = "red",  alpha = 0.2, inherit.aes = FALSE) +
+  labs(x = "Log Time (years)", y = "Change in BMI/bodymass") +
+  theme_mgpub() +
+  theme(panel.grid.major.x = element_line(linewidth = rel(0.5), linetype = 2))
+```
+
+## Time waves
+
+Instead of using pre-post change scores, calculate rate of change (slope). This is then the effect measure for each 'wave'.
+
+Wave is a pre-defined time interval, based on data to some extent:
+
+- 0 - 6
+- 6 - 12
+- 12 - 24
+- 24 - 60
+- 60 - 120
+- 120 - 240
+
+A mutlivariate model is then fit on all the 'waves'
+
+Rate of change is calculated from the change (ROMC) divided by time (in this case months) to get a change/month variable
+
+- yi / d
+
+Variance is calculated as 
+
+- vi / d^2
+
+
+```{r, echo = TRUE}
+wave <- read_csv("data/processed/data_clean_wave_20251022.csv")
+
+
+waves <- tibble::tibble(
+  wave_label = factor(c("0–6", "6–12", "12–24", "24–60", "60-120", "120-240"), levels = c("0–6", "6–12", "12–24", "24–60", "60-120", "120-240")),
+  wave_start = c(0, 6, 12, 24, 60, 120),
+  wave_end   = c(6, 12, 24, 60, 120, 240)
+)
+
+# fit data to each wave 
+expanded <- wave %>%
+  filter(!is.na(vi)) %>%
+  crossing(waves) %>%
+  filter(timepoint_pre <= wave_start + 3,
+         timepoint > wave_start,
+         timepoint > wave_start + ((wave_end - wave_start)/2)) # make sure data covers at least half the wave
+
+
+bm_wave <- expanded %>%
+  filter(variable %in% c("BMI", "Body mass (kg)"),
+         !is.na(yi)) %>%
+  mutate(var_no = case_when(
+    variable == "BMI" ~ 1, # use for filtering later, to prefer BMI measure if available
+    variable == "Body mass (kg)" ~ 2
+  )) %>%
+  group_by(cohort) %>%
+  filter(var_no == min(var_no)) %>% # filter BMI if available, otherwise use bodymass
+  ungroup() %>%
+  group_by(cohort) %>%
+  filter(!cohort %in% c("Moksnes_2013", "Macalpine_2019", "Garcia_2020", "Hanstein_2019",
+                        "Rodriguez_2022", "Whittaker_2025"),
+           !(cohort == "Triplett_2022" & group == "Adolescent")) %>% # studies with mean age <18
+  ungroup()
+
+```
+
+```{r, echo = TRUE}
+
+# Fit covariance matrix again
+waveV <- vcalc(vi_d, 
+               cluster=cohort, 
+               time1 = wave_start,
+               phi=0.9, 
+               data=bm_wave)
+
+# Fit model
+wavemodel <- rma.mv(yi_d, waveV, 
+               mods = ~ wave_label - 1, 
+               data = bm_wave, 
+               random = list(~ wave_label|cohort),
+               struct = c("HAR"))
+
+# Check fit
+profile(wavemodel)
+
+summary(wavemodel)
+
+broom::tidy(wavemodel, conf.int = TRUE) %>% kbl(digits = 5)
+
+broom::tidy(wavemodel, exponentiate = TRUE) %>% kbl(digits = 3)
+```
+
+
+```{r}
+
+wave_estimates <- function(model){
+res <- model
+est <- coef(res)
+V <- vcov(res)
+
+lengths <- c(6, 6, 12, 36, 60, 120)   # months
+  D <- diag(lengths)
+  
+  L <- rbind(
+    c(1, 0, 0, 0, 0, 0),
+    c(1, 1, 0, 0, 0, 0),
+    c(1, 1, 1, 0, 0, 0),
+    c(1, 1, 1, 1, 0, 0),
+    c(1, 1, 1, 1, 1, 0),
+    c(1, 1, 1, 1, 1, 1)
+  )
+  
+  cum_est <- as.numeric(L %*% (D %*% est))
+  cum_se  <- sqrt(diag(L %*% (D %*% V %*% D) %*% t(L)))
+  
+  cum_lwr <- cum_est - 1.96 * cum_se
+  cum_upr <- cum_est + 1.96 * cum_se
+  
+  result <- data.frame(
+    time = c(6, 12, 24, 60, 120, 240),
+    cum_est, cum_lwr, cum_upr
+  ) %>%
+    bind_rows(., data.frame(time = 0, cum_est = 0, cum_lwr = 0, cum_upr = 0)) %>%
+    mutate(across(c(cum_est, cum_lwr, cum_upr), ~exp(.x))) %>%
+    arrange(time)
+  
+return(result)
+}
+
+result <- wave_estimates(wavemodel)
+
+result %>% kbl(digits = 3)
+
+
+waves3 <- waves %>% 
+  bind_cols(., data.frame(wavemodel[1])) %>%
+  rename(slope = 4) %>%
+  mutate(duration = wave_end - wave_start, 
+         delta = slope * duration, 
+         cum = cumsum(delta)) %>%
+  bind_rows(., data.frame(wave_label = "0", wave_start = 0, wave_end = 0, slope = 0, duration = 0, delta = 0,cum= 0))
+
+
+waves3 %>%
+  select(wave_label, slope) %>%
+  filter(wave_label != 0) %>%
+  mutate(slope = exp(slope*120)) %>% kbl(digits = 3)
+
+bmdata %>%
+  bind_rows(., bmdata %>% distinct(cohort, .keep_all = TRUE) %>%
+              mutate(timepoint = 0,
+                     yi = 0)) %>%
+  filter(!cohort %in% c("Moksnes_2013", "Macalpine_2019", "Garcia_2020", "Hanstein_2019",
+                        "Rodriguez_2022", "Whittaker_2025"),
+           !(cohort == "Triplett_2022" & group == "Adolescent")) %>% # studies with mean age <18
+  ggplot(aes(x = timepoint, y = exp(yi), group = cohort)) +
+  geom_hline(yintercept = 1, colour = "dark grey") +
+  geom_line(alpha = 0.8, colour = "grey") + 
+  geom_point(aes(size = actual_n), alpha = 0.3) + 
+  scale_y_continuous(breaks = c(0.95, 1.0, 1.05, 1.1, 1.2), labels = c("-5%", "0%", "+5%", "+10%", "+20%")) +
+  #scale_y_continuous(labels = scales::percent, limits = c(-0.75, 0.25)) +
+  #scale_x_continuous(trans = 'log10', limits = c(3,150)) +
+  scale_x_continuous(breaks = c(0, 6, 12, 24, 72, 120, 240), labels = c(0, 0.5, 1, 2, 6, 10, 20)) +
+  geom_line(data = points, aes(x = x, y = pred), colour = "red", linewidth = 1.3, inherit.aes = FALSE) +
+  geom_polygon(data = poly, aes(x = x, y = ci.ub), fill = "red",  alpha = 0.2, inherit.aes = FALSE) +
+  #geom_line(data = waves3, aes(x = wave_end, y = exp(cum)), colour = "blue", linewidth = 1.3, inherit.aes = FALSE) +
+  geom_lineribbon(data = result, aes(x = time, y = cum_est, ymin = cum_lwr, ymax = cum_upr), colour = "blue",
+                     alpha = 0.6, inherit.aes = F) +
+  labs(x = "Time (years)", y = "Change in BMI/bodymass") +
+  theme_mgpub() +
+  theme(panel.grid.major.x = element_line(linewidth = rel(0.5), linetype = 2))
+
+
+```
+
+
+## Leave one out analysis
+
+Refit model dropping one study at a time. Compare visual fit for now.
+
+- Black = original fit
+- Red = with study dropped
+
+```{r}
+#| fig-height: 15
+# Create list of datasets dropping 1 cohort at a time
+
+baselinebm <- baselinebm %>%
+  mutate(cohort = case_match(cohort,
+                             "MOON" ~ "Spindler_2018",
+                             "Delaware-oslo" ~ "Pederson_2021",
+                             .default = cohort))
+
+dropped_datasets <- lapply(unique(baselinebm[["cohort"]]), function(cohort) {
+  baselinebm[ baselinebm[["cohort"]] != cohort, ]
+})
+
+names(dropped_datasets) <- str_replace(paste0("drop ", unique(baselinebm$cohort)), "_", " ") # name each list element by cohort dropped
+
+
+# Get original predicted model estimates
+points_orig <- data.frame(predict(robust(linearbm, cluster = cohort, clubSandwich = TRUE),
+                                  newmods = seq(1,240, length = 240), transf = exp)) %>% 
+  mutate(x = row_number()) %>%
+  rename_with(.cols = pred:pi.ub, .fn = ~paste("orig", .x, sep = "_"))
+
+# function to iterate through each dropped dataset
+run_metaformodel <- function(data){
+  
+  # generate V
+  looV <- vcalc(vi, 
+             cluster=cohort, 
+             time1=timepoint,
+             phi=0.95, 
+             data=data)
+  
+  # run model
+  model <- rma.mv(yi, looV, 
+                 mods = ~ timepoint, 
+                 data = data, 
+                 random = list(~ timepoint|cohort),
+                 struct = c("CAR"))
+  
+  # get predicted fit
+  points <- data.frame(predict(robust(model, cluster = cohort, clubSandwich = TRUE), newmods = seq(1,240, length = 240), transf = exp)) %>% 
+    mutate(x = row_number()) %>% left_join(points_orig, by = "x")
+  
+  return(points)
+}
+
+loo_analysis <- dropped_datasets %>% 
+  map(run_metaformodel) %>%
+  bind_rows(.id = "cohort_dropped")
+
+# plot each with red line as new, black line as original
+ggplot(loo_analysis, aes(x = x)) +
+  geom_line(aes(y = pred), colour = "red", alpha = 0.7) +
+  geom_ribbon(aes(ymin = ci.lb, ymax = ci.ub), fill = "red", alpha = 0.3) +
+  geom_line(aes(y = orig_pred), alpha = 0.7) +
+  geom_ribbon(aes(ymin = orig_ci.lb, ymax = orig_ci.ub), alpha = 0.3) +
+  facet_wrap(~cohort_dropped, ncol = 3) +
+  scale_y_continuous(breaks = c(0.95, 1.0, 1.05, 1.1, 1.2), labels = c("-5%", "0%", "+5%", "+10%", "+20%")) +
+  scale_x_continuous(breaks = c(0, 24, 60, 120, 240), labels = c(0, 2, 5, 10, 20)) +
+  labs(x = "Time (years)", y = "Change in BMI/bodymass") +
+  theme_mgpub() +
+  theme(panel.grid.major.x = element_line(linewidth = rel(0.5), linetype = 2))
+
+```
